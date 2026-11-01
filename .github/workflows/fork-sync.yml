@@ -5,8 +5,8 @@ name: Fork sync
 
 on:
   schedule:
-    # Every 6 hours, off the top of the hour.
-    - cron: "41 */6 * * *"
+    # Daily, off the top of the hour.
+    - cron: "41 9 * * *"
   workflow_dispatch:
     inputs:
       mode:
