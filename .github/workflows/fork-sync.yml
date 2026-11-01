@@ -1,0 +1,91 @@
+# Fork-only. Keeps `main` a fast-forward mirror of pingdotgg/t3code and merges it
+# into `fork`, the integration branch that carries this fork's changes.
+# Upstream workflows are disabled on this fork; this is the only one that runs.
+name: Fork sync
+
+on:
+  schedule:
+    # Every 6 hours, off the top of the hour.
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: How to bring main into fork
+        type: choice
+        default: merge
+        options: [merge, rebase]
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: pingdotgg/t3code
+  CONFLICT_LABEL: fork-sync-conflict
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fork
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "fork-sync[bot]"
+          git config user.email "fork-sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --quiet origin main:main
+
+      - name: Sync
+        id: sync
+        env:
+          MODE: ${{ inputs.mode || 'merge' }}
+        run: |
+          set +e
+          args=(--push)
+          [ "$MODE" = rebase ] && args+=(--rebase)
+          scripts/fork/sync-upstream.sh "${args[@]}" 2>&1 | tee sync.log
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Open or update conflict issue
+        if: steps.sync.outputs.code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create "$CONFLICT_LABEL" --color d73a4a --description "Automatic upstream sync hit a conflict" --force
+          conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')"
+          body=$(printf '`fork` no longer merges cleanly with upstream `main` @ %s.\n\nConflicting files:\n%s\n\nResolve locally:\n```sh\nscripts/fork/sync-upstream.sh --push\n```\n\nRun: %s' "$UPSTREAM_SHA" "$conflicts" "$RUN_URL")
+          existing=$(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Fork sync conflict with upstream main" --label "$CONFLICT_LABEL" --body "$body"
+          fi
+
+      - name: Close conflict issue once clean
+        if: steps.sync.outputs.code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Sync succeeded; fork is current with upstream main."
+          done
+
+      - name: Report
+        if: always()
+        run: |
+          cat sync.log || true
+          [ "${{ steps.sync.outputs.code }}" = "0" ]
